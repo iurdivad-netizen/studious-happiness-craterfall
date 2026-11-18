@@ -45,7 +45,7 @@ You start every match with unlimited Baby Missiles. Everything else is bought in
 | Missile | $100 | 38 | Bigger blast. |
 | MIRV | $150 | 24 | Climbs as one shell, then splits into 5 warheads at the top of its arc. |
 | Napalm | $200 | 60 | Scatters 8 smaller fragments that each explode where they land. |
-| Nuke | $500 | 120 | Enormous blast. |
+| Nuke | $500 | 120 | Enormous blast, with a full flash, fireball, shockwave and mushroom cloud. |
 | Dirt Ball | $50 | 44 | Deals no damage. Adds terrain instead, for burying or shielding. |
 | Roller | $100 | 26 | Lands and rolls downhill before detonating. |
 | Funky Bomb | $250 | 30 | Bursts into 7 coloured bomblets that each explode where they land. |
