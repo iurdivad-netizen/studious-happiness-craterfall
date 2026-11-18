@@ -474,6 +474,15 @@
 // ─── Constants ───────────────────────────────────────────────────────────────
 const TANK_W = 16, TANK_H = 10;
 
+// Blend a #rgb/#rrggbb colour toward a dusty sand tone (k = 0 unchanged, 1 all sand)
+function dusty(hex, k) {
+  let h = hex.replace('#', '');
+  if (h.length === 3) h = h.split('').map(c => c + c).join('');
+  const sand = [214, 184, 142];
+  const c = [0, 2, 4].map((i, j) => Math.round(parseInt(h.slice(i, i + 2), 16) * (1 - k) + sand[j] * k));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
 function esc(str) {
   return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -1014,12 +1023,12 @@ const WEAPONS = [
   { name:'Missile',      cost:100, radius:38,  damage:40,  projectiles:1, spread:0,   color:'#f80', trail:'#f40' },
   // Climbs as one shell, then splits into `warheads` at the top of its arc
   { name:'MIRV',         cost:150, radius:24,  damage:30,  projectiles:1, spread:0,   color:'#f0f', trail:'#a0a', mirv:true, warheads:5 },
-  { name:'Napalm',       cost:200, radius:60,  damage:55,  projectiles:1, spread:0,   color:'#f40', trail:'#f80', napalm:true },
+  { name:'Napalm',       cost:200, radius:60,  damage:55,  projectiles:1, spread:0,   color:'#f40', trail:'#f80', napalm:true, fx:'napalm' },
   { name:'Nuke',         cost:500, radius:120, damage:100, projectiles:1, spread:0,   color:'#fff', trail:'#ff0', nuke:true },
   { name:'Dirt Ball',    cost:50,  radius:44,  damage:0,   projectiles:1, spread:0,   color:'#840', trail:'#640', dirt:true },
   { name:'Roller',       cost:100, radius:26,  damage:35,  projectiles:1, spread:0,   color:'#0ff', trail:'#08f', roller:true },
   // Bursts on impact into a shower of coloured bomblets, each going off where it lands
-  { name:'Funky Bomb',   cost:250, radius:30,  damage:35,  projectiles:1, spread:0,   color:'#f4f', trail:'#0ff', funky:true, bomblets:7 },
+  { name:'Funky Bomb',   cost:250, radius:30,  damage:35,  projectiles:1, spread:0,   color:'#f4f', trail:'#0ff', funky:true, bomblets:7, fx:'funky' },
   // Detonates, then leaps on in its direction of travel — `hops` more blasts
   { name:'Leap Frog',    cost:150, radius:30,  damage:35,  projectiles:1, spread:0,   color:'#0f8', trail:'#0a5', hops:3 },
 ];
@@ -1080,7 +1089,7 @@ const EVENT_CHANCE = { off: 0, rare: 0.10, occasional: 0.20, chaos: 0.40 };
 
 const EVENT_WEAPONS = {
   lightning: { name:'Lightning', radius:26, damage:60, color:'#ffd', trail:'#ff0' },
-  asteroid:  { name:'Asteroid',  radius:58, damage:80, color:'#fc6', trail:'#f60' },
+  asteroid:  { name:'Asteroid',  radius:58, damage:80, color:'#fc6', trail:'#f60', asteroid:true },
 };
 
 const RANDOM_EVENTS = [
@@ -1157,6 +1166,11 @@ let gusts = [];           // wind-storm streaks
 let quakeTicks = 0, quakeMax = 1, quakeAmp = 0;
 let flashAlpha = 0;       // white lightning flash over the whole field
 let eventBannerTimer = null;
+let fires = [];            // napalm flames licking along the ground
+let rings = [];            // expanding shock rings (asteroid impact, MIRV split)
+let delayed = [];          // timed visual follow-ups, e.g. a wrecked tank's ammo cook-off
+let simTime = 0;           // seconds of simulated time, for effects that fade on a clock
+let scorch = [], scorchT = [];   // per-column crater scorching and when it was laid
 let nukeFx = [];           // mushroom-cloud sequences (see spawnNukeFx)
 let particles = [];        // sparks, debris and smoke from blasts (visual only)
 let shake = 0;             // screen-shake amplitude from big blasts
@@ -1461,6 +1475,7 @@ function beginGame() {
 // ─── Terrain generation ───────────────────────────────────────────────────────
 function generateTerrain() {
   terrain = new Array(W).fill(0);
+  scorch = new Float32Array(W); scorchT = new Float32Array(W);
 
   // Use power-of-two size >= W for clean midpoint displacement
   let size = 1;
@@ -1699,11 +1714,31 @@ function drawTerrain() {
   ctx.moveTo(0, terrain[0]);
   for (let x = 1; x < W; x++) ctx.lineTo(x, terrain[x]);
   ctx.stroke();
+  // Scorched crater walls: a charred band under the surface line, glowing
+  // ember-orange for the first moments after the blast
+  if (scorch.length === W) {
+    for (let x = 0; x < W; x++) {
+      const sc = scorch[x];
+      if (sc < 0.03) continue;
+      const ty = terrain[x];
+      ctx.fillStyle = `rgba(10,6,4,${0.55 * sc})`;
+      ctx.fillRect(x, ty, 1, 3 + sc * 8);
+      ctx.fillStyle = `rgba(28,16,8,${0.85 * sc})`;           // burnt-out surface line
+      ctx.fillRect(x, ty - 1, 1, 3);
+      const glow = 1 - (simTime - scorchT[x]) / 1.7;
+      if (glow > 0) { ctx.fillStyle = `rgba(255,120,30,${0.75 * glow * sc})`; ctx.fillRect(x, ty - 1, 1, 3); }
+    }
+  }
 }
 
 function drawWreck(p) {
   const x = p.x, y = getTerrainY(p.x);   // settles with the ground even after craters
   ctx.save();
+  if (p.smokeT > 0) {                    // still burning
+    ctx.globalCompositeOperation = 'lighter';
+    drawFlame(x - 1, y - TANK_H + 3, 4.5, 11 + 3 * Math.sin(animTime * 12 + p.id), p.id, Math.min(1, p.smokeT / 2) * 0.85);
+    ctx.globalCompositeOperation = 'source-over';
+  }
   ctx.fillStyle = '#1b1b1b';
   ctx.fillRect(x - TANK_W/2, y - TANK_H + 2, TANK_W, TANK_H - 2);
   ctx.beginPath(); ctx.arc(x - 2, y - TANK_H + 2, 4.5, Math.PI, 0); ctx.fill();
@@ -1804,10 +1839,31 @@ function drawTurnMarker(p) {
   ctx.restore();
 }
 
+// Dirt ball: no flame, just earth. A soft dust dome and a low ground thump ring.
+function drawDirtBlast(ex) {
+  const t = 1 - ex.life / ex.maxLife;
+  const soil = dusty(PLANETS[activePlanetIdx].terrainFill[1], 0.5);   // hex-or-rgb: rgba() below only parses hex
+  const fade = Math.pow(1 - t, 1.1);
+  const r = ex.radius * (0.5 + 0.7 * Math.sqrt(t));
+  ctx.save();
+  const g = ctx.createRadialGradient(ex.x, ex.y, r * 0.1, ex.x, ex.y, r);
+  const m = soil.match(/\d+/g).join(',');
+  g.addColorStop(0, `rgba(${m},${0.6 * fade})`);
+  g.addColorStop(1, `rgba(${m},0)`);
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(ex.x, ex.y, r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = `rgba(210,175,130,${0.5 * (1 - t)})`;
+  ctx.lineWidth = 1 + 2 * (1 - t);
+  ctx.beginPath(); ctx.ellipse(ex.x, ex.y, ex.radius * (0.4 + 1.3 * t), ex.radius * 0.16 * (0.4 + 1.3 * t), 0, 0, Math.PI * 2); ctx.stroke();
+  ctx.restore();
+}
+
 // Layered fireball: a coloured glow that swells, a hot white core that shrinks,
 // and a shockwave ring racing outward. Additive blending makes overlaps bloom.
 function drawExplosions() {
   for (const ex of explosions) {
+    if (ex.kind === 'dirt') { drawDirtBlast(ex); continue; }
+    const napalm = ex.kind === 'napalm';
     const t = 1 - ex.life / ex.maxLife;             // 0 → 1 over the blast
     const col = ex.color || '#f80';
     const grow = Math.sqrt(t);
@@ -1826,14 +1882,14 @@ function drawExplosions() {
     const cr = r * 0.62 * (1 - t * 0.85);
     if (cr > 1) {
       g = ctx.createRadialGradient(ex.x, ex.y, 0, ex.x, ex.y, cr);
-      g.addColorStop(0, `rgba(255,255,255,${0.95 * fade})`);
-      g.addColorStop(0.5, `rgba(255,235,140,${0.8 * fade})`);
+      g.addColorStop(0, napalm ? `rgba(255,225,120,${0.95 * fade})` : `rgba(255,255,255,${0.95 * fade})`);
+      g.addColorStop(0.5, napalm ? `rgba(255,140,30,${0.8 * fade})` : `rgba(255,235,140,${0.8 * fade})`);
       g.addColorStop(1, 'rgba(255,200,80,0)');
       ctx.fillStyle = g;
       ctx.beginPath(); ctx.arc(ex.x, ex.y, cr, 0, Math.PI * 2); ctx.fill();
     }
     // shockwave
-    if (ex.radius >= 14) {
+    if (ex.radius >= 14 && !napalm) {
       ctx.strokeStyle = `rgba(255,255,255,${0.5 * (1 - t)})`;
       ctx.lineWidth = 1 + 3 * (1 - t);
       ctx.beginPath(); ctx.arc(ex.x, ex.y, ex.radius * (0.35 + 1.45 * t), 0, Math.PI * 2); ctx.stroke();
@@ -2020,6 +2076,7 @@ function spawnBlastFx(x, y, radius, color, o) {
   const soil = [planet.terrainFill[1], planet.terrainFill[0], planet.terrainStroke];
   const big = 0.5 + radius / 80;
 
+  const napalm = o.fx === 'napalm', funky = o.fx === 'funky';
   if (!o.dirt) {
     const n = Math.min(60, Math.round(8 + radius * 0.5));
     for (let i = 0; i < n; i++) {
@@ -2027,7 +2084,7 @@ function spawnBlastFx(x, y, radius, color, o) {
       const spd = (60 + Math.random() * 280) * big * (a > Math.PI ? 1 : 0.75);
       const life = 0.35 + Math.random() * 0.55;
       particles.push({ k:'spark', x, y, vx:Math.cos(a) * spd, vy:Math.sin(a) * spd - 40,
-        life, max:life, col: Math.random() < 0.5 ? '#fff' : (o.tank ? color : (color || '#fa0')), size:1 + Math.random() * 1.6 });
+        life, max:life, col: napalm ? ['#fa0', '#f60', '#ff8'][i % 3] : Math.random() < 0.5 ? '#fff' : (o.tank ? color : (color || '#fa0')), size:1 + Math.random() * 1.6 });
     }
   }
   const nd = Math.min(46, Math.round((4 + radius * 0.35) * (o.dirt ? 1.8 : 1)));
@@ -2038,13 +2095,33 @@ function spawnBlastFx(x, y, radius, color, o) {
     particles.push({ k:'debris', x:x + (Math.random() - 0.5) * radius * 0.5, y, vx:Math.cos(a) * spd, vy:Math.sin(a) * spd,
       life, max:life, col: o.tank && i % 2 ? color : soil[i % 3], size:1.5 + Math.random() * 3, rot:Math.random() * 6, vr:(Math.random() - 0.5) * 14 });
   }
-  const ns = Math.min(10, 2 + Math.round(radius / 10));
+  if (funky) {                                  // confetti
+    for (let i = 0; i < 16; i++) {
+      const a = -Math.PI / 2 + (Math.random() - 0.5) * 2.6, spd = 80 + Math.random() * 200;
+      const life = 1.1 + Math.random() * 0.8;
+      particles.push({ k:'debris', x, y, vx:Math.cos(a) * spd, vy:Math.sin(a) * spd, life, max:life,
+        col: FUNKY_COLORS[i % FUNKY_COLORS.length], size:2 + Math.random() * 2.5, rot:Math.random() * 6, vr:(Math.random() - 0.5) * 22 });
+    }
+  }
+  const ns = o.dirt ? Math.min(14, 6 + Math.round(radius / 6)) : napalm ? Math.min(14, 4 + Math.round(radius / 8)) : Math.min(10, 2 + Math.round(radius / 10));
   for (let i = 0; i < ns; i++) {
-    const life = 0.9 + Math.random() * 1.0;
+    const life = (o.dirt ? 1.3 : 0.9) + Math.random() * 1.0;
     particles.push({ k:'smoke', x:x + (Math.random() - 0.5) * radius * 0.9, y:y + (Math.random() - 0.3) * radius * 0.4,
-      vx:(Math.random() - 0.5) * 24 + wind * 0.15, vy:-18 - Math.random() * 34,
-      life, max:life, size:radius * (0.18 + Math.random() * 0.2), grow:radius * (0.25 + Math.random() * 0.3),
-      col: o.dirt ? soil[0] : '#4a4a4a' });
+      vx:(Math.random() - 0.5) * (o.dirt ? 60 : 24) + wind * 0.15, vy:(napalm ? -45 : -18) - Math.random() * (napalm ? 55 : 34),
+      life, max:life, size:radius * ((o.dirt ? 0.26 : 0.18) + Math.random() * 0.2), grow:radius * (0.25 + Math.random() * 0.3),
+      col: o.dirt ? dusty(soil[1], 0.55) : napalm ? '#1d1d1d' : '#4a4a4a' });
+  }
+}
+
+function thud(x, y) {
+  for (let i = 0; i < 5; i++) {
+    const life = 0.5 + Math.random() * 0.4;
+    particles.push({ k:'smoke', x:x + (Math.random() - 0.5) * 8, y:y - 2, vx:(Math.random() - 0.5) * 50, vy:-12 - Math.random() * 20,
+      life, max:life, size:3 + Math.random() * 3, grow:12, col:'#6a5a48' });
+  }
+  for (let i = 0; i < 6; i++) {
+    const life = 0.3 + Math.random() * 0.3;
+    particles.push({ k:'spark', x, y:y - 2, vx:(Math.random() - 0.5) * 120, vy:-40 - Math.random() * 110, life, max:life, col:'#ffd070', size:1.3 });
   }
 }
 
@@ -2063,7 +2140,163 @@ function updateParticles(dt) {
       if (p.k === 'spark') { p.vx *= Math.pow(0.35, dt); }
       else p.rot += p.vr * dt;
       p.x += p.vx * dt; p.y += p.vy * dt;
-      if (p.vy > 0 && p.y >= getTerrainY(p.x)) particles.splice(i, 1);   // lands in the dirt
+      if (p.vy > 0 && p.y >= getTerrainY(p.x)) {                           // lands in the dirt
+        if (p.k === 'part') thud(p.x, getTerrainY(p.x));
+        particles.splice(i, 1);
+      }
+    }
+  }
+}
+
+// ─── Napalm flames, shock rings and timed follow-ups ──────────────────────────
+function spawnFlames(cx, cy, wep) {
+  if (speedLevel >= 3) return;
+  const frag = !!wep.frag;
+  const n = frag ? 3 : 11, spread = wep.radius * (frag ? 0.9 : 1.0);
+  for (let i = 0; i < n && fires.length < 70; i++) {
+    const life = (frag ? 1.1 : 1.5) + Math.random() * (frag ? 0.9 : 1.1);   // brief: it must not read as a lasting hazard
+    fires.push({ x: Math.max(1, Math.min(W - 2, cx + (Math.random() * 2 - 1) * spread)),
+      r: (frag ? 9 : 15) * (0.7 + Math.random() * 0.6), life, max:life, seed: Math.random() * 10, em: Math.random() * 0.1 });
+  }
+}
+
+// A flame is a teardrop that sways; stacked with a smaller, hotter one it reads as fire
+function drawFlame(x, gy, r, h, seed, a) {
+  if (h <= 0.5 || a <= 0.01) return;
+  const sw = Math.sin(animTime * 13 + seed * 5) * r * 0.35, sw2 = Math.sin(animTime * 9 + seed * 3) * r * 0.25;
+  const g = ctx.createLinearGradient(0, gy, 0, gy - h);
+  g.addColorStop(0, `rgba(255,235,130,${a})`);
+  g.addColorStop(0.45, `rgba(255,120,20,${a * 0.85})`);
+  g.addColorStop(1, 'rgba(160,20,0,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(x - r, gy);
+  ctx.quadraticCurveTo(x - r * 0.7 + sw, gy - h * 0.55, x + sw2, gy - h);
+  ctx.quadraticCurveTo(x + r * 0.7 + sw, gy - h * 0.5, x + r, gy);
+  ctx.closePath(); ctx.fill();
+}
+
+function drawFires() {
+  if (!fires.length) return;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const f of fires) {
+    const gy = getTerrainY(f.x), t = f.life / f.max;
+    const rise = Math.min(1, (f.max - f.life) * 5), fade = Math.min(1, t * 2.5), k = rise * fade;
+    const h = f.r * (2.4 + 0.7 * Math.sin(animTime * 11 + f.seed * 7)) * k;
+    const gl = ctx.createRadialGradient(f.x, gy, 0, f.x, gy, f.r * 2);
+    gl.addColorStop(0, `rgba(255,120,30,${0.4 * k})`); gl.addColorStop(1, 'rgba(255,60,0,0)');
+    ctx.fillStyle = gl; ctx.beginPath(); ctx.arc(f.x, gy, f.r * 2, 0, Math.PI * 2); ctx.fill();
+    drawFlame(f.x, gy, f.r, h, f.seed, 0.85 * fade);
+    drawFlame(f.x + Math.sin(f.seed) * 2, gy, f.r * 0.5, h * 0.62, f.seed + 2, 0.9 * fade);
+  }
+  ctx.restore();
+}
+
+// A rock hitting hard: debris sheet, ember spray, dust and a ground ring
+function spawnImpactFx(x, y, wep) {
+  if (!reduceMotion) shake = Math.max(shake, 11);
+  flashAlpha = Math.max(flashAlpha, reduceMotion ? 0.1 : 0.4);
+  if (speedLevel >= 3) return;
+  rings.push({ x, y, t:0, dur:1.1, maxR: Math.max(260, W * 0.22), flat:true });
+  rings.push({ x, y, t:0, dur:0.5, maxR: wep.radius * 2.2, flat:false });
+  const planet = PLANETS[activePlanetIdx];
+  const soil = [planet.terrainFill[1], planet.terrainFill[0], planet.terrainStroke];
+  for (let i = 0; i < 55; i++) {
+    const a = -Math.PI / 2 + (Math.random() - 0.5) * 2.4, spd = 120 + Math.random() * 380;
+    const life = 1.0 + Math.random() * 1.2;
+    particles.push({ k:'debris', x:x + (Math.random() - 0.5) * wep.radius, y, vx:Math.cos(a) * spd, vy:Math.sin(a) * spd, life, max:life,
+      col:soil[i % 3], size:2 + Math.random() * 4, rot:Math.random() * 6, vr:(Math.random() - 0.5) * 12 });
+  }
+  for (let i = 0; i < 28; i++) {            // red-hot ejecta
+    const a = -Math.PI * Math.random(), spd = 140 + Math.random() * 340;
+    const life = 0.8 + Math.random() * 1.0;
+    particles.push({ k:'spark', x, y:y - 4, vx:Math.cos(a) * spd, vy:Math.sin(a) * spd, life, max:life, col: i % 2 ? '#ff7a30' : '#ffc060', size:1.8 + Math.random() * 1.8 });
+  }
+  for (let i = 0; i < 12; i++) {            // dust rolling out along the ground
+    const dir = i % 2 ? 1 : -1, life = 1.4 + Math.random() * 1.0;
+    particles.push({ k:'smoke', x:x + dir * Math.random() * 20, y:y - 4, vx:dir * (80 + Math.random() * 150), vy:-8 - Math.random() * 22,
+      life, max:life, size:8 + Math.random() * 8, grow:18 + Math.random() * 16, col:'#6a5a48' });
+  }
+}
+
+function drawRings() {
+  for (const r of rings) {
+    const k = r.t / r.dur, e = 1 - Math.pow(1 - k, 3);
+    ctx.save();
+    ctx.strokeStyle = `rgba(255,240,215,${0.6 * (1 - k)})`;
+    ctx.lineWidth = 1.5 + 3.5 * (1 - k);
+    ctx.beginPath();
+    if (r.flat) ctx.ellipse(r.x, r.y, r.maxR * e, r.maxR * e * 0.12, 0, 0, Math.PI * 2);
+    else ctx.arc(r.x, r.y, r.maxR * e, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// Asteroid: a tumbling rock inside a flame sheath
+function drawAsteroid(p) {
+  const sp = Math.hypot(p.vx, p.vy) || 1, ux = p.vx / sp, uy = p.vy / sp;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  const tail = 110, w = 13;
+  const tx = p.x - ux * tail, ty = p.y - uy * tail, nx = -uy, ny = ux;
+  const g = ctx.createLinearGradient(p.x, p.y, tx, ty);
+  g.addColorStop(0, 'rgba(255,225,140,0.95)'); g.addColorStop(0.35, 'rgba(255,110,20,0.7)'); g.addColorStop(1, 'rgba(160,20,0,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(p.x + nx * w, p.y + ny * w);
+  ctx.quadraticCurveTo(p.x - ux * tail * 0.5 + nx * w * 0.9, p.y - uy * tail * 0.5 + ny * w * 0.9, tx, ty);
+  ctx.quadraticCurveTo(p.x - ux * tail * 0.5 - nx * w * 0.9, p.y - uy * tail * 0.5 - ny * w * 0.9, p.x - nx * w, p.y - ny * w);
+  ctx.closePath(); ctx.fill();
+  const halo = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 34);
+  halo.addColorStop(0, 'rgba(255,190,90,0.7)'); halo.addColorStop(1, 'rgba(255,90,20,0)');
+  ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(p.x, p.y, 34, 0, Math.PI * 2); ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.translate(p.x, p.y); ctx.rotate(p.age * 0.07);
+  ctx.fillStyle = '#6a5240'; ctx.strokeStyle = '#2a1a10'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  const pts = [8, 6.5, 8.5, 7, 9, 6, 8, 7.5, 6.5];
+  pts.forEach((r, i) => { const a = i / pts.length * Math.PI * 2; i ? ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r) : ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r); });
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = 'rgba(255,170,70,0.55)';
+  ctx.beginPath(); ctx.arc(-2, -1, 3, 0, Math.PI * 2); ctx.fill();    // glowing leading face
+  ctx.restore();
+}
+
+function updateExtraFx(dt) {
+  simTime += dt;
+  for (let i = delayed.length - 1; i >= 0; i--) {
+    delayed[i].t -= dt;
+    if (delayed[i].t <= 0) { const d = delayed.splice(i, 1)[0]; d.fn(); }
+  }
+  for (let i = rings.length - 1; i >= 0; i--) {
+    rings[i].t += dt;
+    if (rings[i].t >= rings[i].dur) rings.splice(i, 1);
+  }
+  const roomy = particles.length < MAX_PARTICLES && speedLevel < 3;
+  for (let i = fires.length - 1; i >= 0; i--) {
+    const f = fires[i];
+    f.life -= dt;
+    if (f.life <= 0) { fires.splice(i, 1); continue; }
+    f.em -= dt;
+    if (f.em <= 0 && roomy) {
+      f.em = 0.1;
+      const gy = getTerrainY(f.x), life = 0.9 + Math.random() * 0.7;
+      particles.push({ k:'smoke', x:f.x + (Math.random() - 0.5) * f.r, y:gy - f.r * 1.6, vx:(Math.random() - 0.5) * 14 + wind * 0.2, vy:-38 - Math.random() * 30,
+        life, max:life, size:f.r * 0.45, grow:f.r * 0.9, col:'#1d1d1d' });
+      if (Math.random() < 0.35) particles.push({ k:'spark', x:f.x, y:gy - f.r, vx:(Math.random() - 0.5) * 50, vy:-70 - Math.random() * 90,
+        life:0.6, max:0.6, col:'#ffb050', size:1.3 });
+    }
+  }
+  for (const p of players) {                         // burning wrecks
+    if (p.alive || !(p.smokeT > 0)) continue;
+    p.smokeT -= dt; p.smokeAcc = (p.smokeAcc || 0) - dt;
+    if (p.smokeAcc <= 0 && roomy) {
+      p.smokeAcc = 0.11;
+      const life = 1.4 + Math.random() * 0.8, gy = getTerrainY(p.x);
+      particles.push({ k:'smoke', x:p.x + (Math.random() - 0.5) * 6, y:gy - TANK_H, vx:(Math.random() - 0.5) * 10 + wind * 0.25, vy:-32 - Math.random() * 18,
+        life, max:life, size:4 + Math.random() * 2, grow:13, col:'#5a524c' });
     }
   }
 }
@@ -2090,6 +2323,13 @@ function drawSparks() {
       ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
       ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size * 0.7);
       ctx.restore();
+    } else if (p.k === 'part') {                          // the blown-off turret
+      ctx.globalAlpha = 1;
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+      ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(0, 0, p.size, Math.PI, 0); ctx.fill();
+      ctx.fillStyle = '#222'; ctx.fillRect(-p.size, 0, p.size * 2, 2);
+      ctx.strokeStyle = p.col; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(0, -p.size * 0.6); ctx.lineTo(p.size * 2.4, -p.size * 1.3); ctx.stroke();
+      ctx.restore();
     }
   }
   ctx.globalCompositeOperation = 'lighter';
@@ -2108,14 +2348,37 @@ function drawSparks() {
   ctx.restore();
 }
 
+// A tank's end is a sequence: the initial blast, the turret blown clear, a
+// secondary ammo cook-off a beat later, then a burning wreck that smokes for a while.
 function tankDeathFx(p) {
   const y = p.y - TANK_H / 2;
   explosions.push({ x:p.x, y, radius:44, color:'#f70', life:70, maxLife:70, phase:0 });
   spawnBlastFx(p.x, y, 44, p.color, { tank:true });
+  if (speedLevel >= 3) { p.smokeT = 0; return; }
+  p.smokeT = 6; p.smokeAcc = 0;
+  particles.push({ k:'part', x:p.x, y:y - 4, vx:(Math.random() - 0.5) * 150, vy:-(230 + Math.random() * 170),
+    life:3, max:3, rot:0, vr:(Math.random() - 0.5) * 11, col:p.color, size:5 });
+  const px = p.x, py = p.y;
+  delayed.push({ t: 0.32 + Math.random() * 0.2, fn: () => cookOff(px, py, 30, 1) });
+  delayed.push({ t: 0.6 + Math.random() * 0.25, fn: () => cookOff(px + (Math.random() - 0.5) * 10, py, 20, 0.6) });
+}
+
+function cookOff(x, groundY, radius, loud) {
+  const y = groundY - TANK_H / 2;
+  explosions.push({ x, y, radius, color:'#fc6', life:34, maxLife:34, phase:0 });
+  if (!reduceMotion) shake = Math.max(shake, 3 + 3 * loud);
+  SoundManager.playExplosion('', radius);
+  if (particles.length > MAX_PARTICLES) return;
+  for (let i = 0; i < 18; i++) {
+    const a = -Math.PI * Math.random(), spd = 90 + Math.random() * 260 * loud;
+    const life = 0.4 + Math.random() * 0.5;
+    particles.push({ k:'spark', x, y, vx:Math.cos(a) * spd, vy:Math.sin(a) * spd, life, max:life, col: i % 2 ? '#ffe9a0' : '#ff9030', size:1.2 + Math.random() * 1.4 });
+  }
 }
 
 function drawProjectiles() {
   for (const p of projectiles) {
+    if (p.asteroid) { drawAsteroid(p); continue; }
     if (p.trail && p.trail.length > 1) {
       ctx.strokeStyle = p.trailColor || '#fa0';
       ctx.lineWidth = 2;
@@ -2218,7 +2481,9 @@ function render() {
     drawTurnMarker(turnTank);
   }
   drawNukeFx();
+  drawRings();
   drawExplosions();
+  drawFires();
   drawProjectiles();
   drawSparks();
   drawEventFx();
@@ -2263,7 +2528,8 @@ function tankAt(px, py, excludeId) {
   return null;
 }
 
-function blastCrater(cx, cy, radius) {
+function blastCrater(cx, cy, radius, heat) {
+  heat = heat == null ? 0.8 : heat;
   const r2 = radius * radius;
   for (let x = Math.max(0, Math.floor(cx - radius)); x <= Math.min(W - 1, Math.ceil(cx + radius)); x++) {
     const dx = x - cx;
@@ -2275,6 +2541,16 @@ function blastCrater(cx, cy, radius) {
     // Only carve if the explosion circle reaches above (or into) the terrain surface
     if (circleTop < terrain[x]) {
       terrain[x] = Math.min(H - 2, Math.max(terrain[x], circleBot));
+    }
+  }
+  // Char the new crater surface, strongest at the centre of the blast
+  if (scorch.length === W) {
+    const reach = radius * 1.2;
+    for (let x = Math.max(0, Math.floor(cx - reach)); x <= Math.min(W - 1, Math.ceil(cx + reach)); x++) {
+      const k = 1 - Math.pow(Math.abs(x - cx) / reach, 2);
+      if (k <= 0) continue;
+      scorch[x] = Math.min(1, Math.max(scorch[x], heat * k));
+      scorchT[x] = simTime;
     }
   }
 }
@@ -2289,6 +2565,7 @@ function dirtUp(cx, cy, radius) {
     // Only pile dirt where the dome extends above the current surface
     if (circleTop < terrain[x]) {
       terrain[x] = Math.max(H * 0.05, circleTop);
+      if (scorch.length === W) scorch[x] *= 0.25;      // fresh dirt buries the char
     }
   }
 }
@@ -2337,9 +2614,13 @@ function flightLife(speed, minTicks) {
 }
 
 function explodeAt(cx, cy, wep, ownerId) {
-  wep.dirt ? dirtUp(cx, cy, wep.radius) : blastCrater(cx, cy, wep.radius);
-  explosions.push({ x:cx, y:cy, radius:wep.radius, color:wep.color, life:45, maxLife:45, phase:0 });
-  spawnBlastFx(cx, cy, wep.radius, wep.color, { dirt: !!wep.dirt });
+  wep.dirt ? dirtUp(cx, cy, wep.radius) : blastCrater(cx, cy, wep.radius, (wep.napalm || wep.frag || wep.nuke) ? 1 : 0.8);
+  // A dirt ball is a thump of earth, not a fireball: it gets its own dust blast
+  const kind = wep.dirt ? 'dirt' : (wep.napalm || wep.frag) ? 'napalm' : '';
+  explosions.push({ x:cx, y:cy, radius:wep.radius, color:wep.dirt ? '#a60' : wep.color, kind, life:wep.dirt ? 40 : 45, maxLife:wep.dirt ? 40 : 45, phase:0 });
+  spawnBlastFx(cx, cy, wep.radius, wep.color, { dirt: !!wep.dirt, fx: wep.fx });
+  if (wep.napalm || wep.frag) spawnFlames(cx, cy, wep);
+  if (wep.asteroid) spawnImpactFx(cx, cy, wep);
   if (wep.nuke && speedLevel < 3) spawnNukeFx(cx, cy, wep);
   SoundManager.playExplosion(wep.name, wep.radius);
   // Remember where each player's last shot first landed, for the aim guide
@@ -2353,7 +2634,7 @@ function explodeAt(cx, cy, wep, ownerId) {
       projectiles.push({
         x:cx, y:cy,
         vx: Math.cos(a)*spd, vy: -Math.abs(Math.sin(a))*spd*0.5 - 30,
-        weapon: {...wep, radius:wep.radius*0.4, damage:wep.damage*0.5, napalm:false},
+        weapon: {...wep, radius:wep.radius*0.4, damage:wep.damage*0.5, napalm:false, frag:true},
         ownerId, color:'#f80', trailColor:'#f40', trail:[], life:flightLife(spd, 120),
         age:0, hopsLeft:0,
       });
@@ -2417,6 +2698,14 @@ function splitMirv(proj) {
     });
   }
   explosions.push({ x:proj.x, y:proj.y, radius:16, color:wep.color, life:14, maxLife:14, phase:0 });
+  if (speedLevel < 3) {
+    rings.push({ x:proj.x, y:proj.y, t:0, dur:0.35, maxR:40, flat:false });
+    for (let i = 0; i < 9; i++) {                       // the spent dispenser casing coming apart
+      const a = Math.random() * Math.PI * 2, spd = 60 + Math.random() * 160, life = 0.5 + Math.random() * 0.5;
+      particles.push({ k: i % 3 ? 'spark' : 'debris', x:proj.x, y:proj.y, vx:Math.cos(a) * spd + proj.vx * 0.3, vy:Math.sin(a) * spd + proj.vy * 0.3,
+        life, max:life, col: i % 3 ? '#ffd0ff' : '#8a8a96', size: i % 3 ? 1.4 : 2.2, rot:0, vr:(Math.random() - 0.5) * 18 });
+    }
+  }
   SoundManager.playSplit();
 }
 
@@ -2440,7 +2729,7 @@ function spawnBomblets(cx, cy, wep, ownerId) {
     projectiles.push({
       x: cx, y: cy - 4,
       vx: Math.cos(a) * spd, vy: -Math.sin(a) * spd,
-      weapon: sub, ownerId,
+      weapon: { ...sub, color: col }, ownerId,
       color: col, trailColor: col, trail: [],
       life: flightLife(spd, 400), roller: false, rolling: false,
       size: 4, glow: true,
@@ -2656,7 +2945,7 @@ function runAsteroid() {
     weapon: EVENT_WEAPONS.asteroid, ownerId: -1,
     color: EVENT_WEAPONS.asteroid.color, trailColor: EVENT_WEAPONS.asteroid.trail,
     trail: [], life: 900, roller: false, rolling: false,
-    size: 7, glow: true,
+    size: 7, glow: true, asteroid: true,
     age: 0, hopsLeft: 0,
   });
   eventHold = 12;
@@ -2845,7 +3134,7 @@ function drawEventFx() {
 }
 
 function clearEventFx() {
-  bolts = []; drops = []; gusts = []; particles = []; nukeFx = []; shake = 0;
+  bolts = []; drops = []; gusts = []; particles = []; nukeFx = []; fires = []; rings = []; delayed = []; shake = 0;
   quakeTicks = 0; flashAlpha = 0; eventHold = 0;
   eventActive = false;
   hideEventBanner();
@@ -2894,6 +3183,7 @@ function physicsStep(dt) {
   updateEventFx(dt);
   updateParticles(dt);
   updateNukeFx(dt);
+  updateExtraFx(dt);
 
   for (let i = explosions.length-1; i >= 0; i--) {
     const ex = explosions[i];
@@ -2942,6 +3232,27 @@ function physicsStep(dt) {
     proj.life--;
     proj.age++;
     const ty = getTerrainY(proj.x);
+    if (speedLevel < 3 && particles.length < MAX_PARTICLES) {
+      if (proj.asteroid) {            // streaming sparks and a smoke trail
+        const sp = Math.hypot(proj.vx, proj.vy) || 1;
+        for (let k = 0; k < 2; k++) {
+          const life = 0.35 + Math.random() * 0.4;
+          particles.push({ k:'spark', x:proj.x + (Math.random() - 0.5) * 8, y:proj.y + (Math.random() - 0.5) * 8,
+            vx:-proj.vx / sp * 40 + (Math.random() - 0.5) * 70, vy:-proj.vy / sp * 40 + (Math.random() - 0.5) * 70,
+            life, max:life, col: k ? '#ffd080' : '#ff7a30', size:1.6 });
+        }
+        const life = 1.2 + Math.random() * 0.6;
+        particles.push({ k:'smoke', x:proj.x, y:proj.y, vx:(Math.random() - 0.5) * 16, vy:(Math.random() - 0.5) * 16,
+          life, max:life, size:6, grow:20, col:'#3a3029' });
+      } else if (proj.rolling && proj.age % 2 === 0) {   // dust kicked up behind a roller
+        const soil = PLANETS[activePlanetIdx].terrainFill[1];
+        const life = 0.5 + Math.random() * 0.3;
+        particles.push({ k:'smoke', x:proj.x, y:ty - 2, vx:-proj.vx * 0.1 + (Math.random() - 0.5) * 24, vy:-10 - Math.random() * 22,
+          life, max:life, size:3 + Math.random() * 2, grow:11, col:soil });
+        if (Math.random() < 0.4) particles.push({ k:'spark', x:proj.x, y:ty - 2, vx:-proj.vx * 0.2 + (Math.random() - 0.5) * 60, vy:-40 - Math.random() * 90,
+          life:0.3, max:0.3, col:'#ffd070', size:1.3 });
+      }
+    }
 
     // Tank collision — projectiles explode on direct contact with a tank.
     // Sample points along the swept path so fast shots can't tunnel through.
@@ -3004,7 +3315,7 @@ function physicsStep(dt) {
   const anyFalling = updateTankPhysics(dt);
 
   if (projectiles.length === 0 && explosions.length === 0 && !anyFalling &&
-      drops.length === 0 && eventHold <= 0 && animating) {
+      drops.length === 0 && delayed.length === 0 && eventHold <= 0 && animating) {
     animating = false;
     document.getElementById('fire-btn').disabled = false;
     for (const p of players) {
@@ -3419,6 +3730,7 @@ function startMatch() {
     p.outOfAmmo = false;
     p.lastImpact = null;
     p.awaitImpact = false;
+    p.smokeT = 0;
   });
   activePlanetIdx = setupConfig.gravityMode === 'random'
     ? Math.floor(Math.random() * PLANETS.length)
@@ -3511,6 +3823,12 @@ window.addEventListener('resize', () => {
     const lo = Math.floor(ox), hi = Math.min(lo + 1, oldW - 1);
     const frac = ox - lo;
     terrain[x] = (oldTerrain[lo] * (1 - frac) + oldTerrain[hi] * frac) * hScale;
+  }
+
+  if (scorch.length) {
+    const os = scorch, ot = scorchT;
+    scorch = new Float32Array(W); scorchT = new Float32Array(W);
+    for (let x = 0; x < W; x++) { const ox = Math.min(os.length - 1, Math.floor(x / wScale)); scorch[x] = os[ox]; scorchT[x] = ot[ox]; }
   }
 
   // Scale tank positions proportionally
